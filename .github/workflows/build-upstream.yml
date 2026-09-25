@@ -71,16 +71,22 @@ jobs:
           text = dockerfile.read_text()
 
           # --------------------------------------------------------
-          # Add official Node.js 24 image as a build stage.
-          # This gives us a modern Node/npm/npx instead of Debian's
-          # older Node.js package.
+          # Add official Node.js 24 as an additional build stage.
+          #
+          # We intentionally do NOT install Debian's nodejs/npm
+          # packages because they currently provide Node 18, which
+          # is too old for packages such as Hyperframes/Puppeteer.
           # --------------------------------------------------------
 
           text = "FROM node:24-bookworm-slim AS node-runtime\n\n" + text
 
           # --------------------------------------------------------
-          # Add curl + GitHub CLI to Nanobot's runtime packages.
-          # Do NOT install Debian's nodejs/npm packages.
+          # Add runtime CLI tools.
+          #
+          # curl -> Weather and general HTTP-based skills
+          # gh   -> GitHub skill
+          #
+          # Node/npm/npx come from node-runtime above.
           # --------------------------------------------------------
 
           original = (
@@ -103,15 +109,19 @@ jobs:
           text = text.replace(original, replacement, 1)
 
           # --------------------------------------------------------
-          # Copy Node.js 24 + npm/npx into the final Nanobot image.
+          # Add Node.js 24 and configure npm for the unprivileged
+          # Nanobot user.
           #
-          # Configure npm global installs to use a directory owned by
-          # the unprivileged nanobot user instead of:
+          # Nanobot's CLI app installer runs:
           #
-          #   /usr/local/lib/node_modules
+          #     npm install -g <package>
           #
-          # This allows Nanobot/ClawHub to install npm-based apps
-          # without running Nanobot as root.
+          # Global npm packages therefore need a location writable
+          # by UID 1000 rather than /usr/local/lib/node_modules.
+          #
+          # .npmrc is intentionally created as well as setting the
+          # environment variable so npm still sees the correct
+          # prefix if Nanobot sanitises subprocess environment vars.
           # --------------------------------------------------------
 
           marker = "ENTRYPOINT"
@@ -130,15 +140,24 @@ jobs:
           # Node.js 24 + npm + npx
           COPY --from=node-runtime /usr/local/ /usr/local/
 
-          # User-writable location for global npm packages
+          # Install global npm packages into Nanobot's home directory
+          # instead of root-owned /usr/local/lib/node_modules.
           ENV NPM_CONFIG_PREFIX=/home/nanobot/.npm-global
-          ENV PATH="/home/nanobot/.npm-global/bin:${PATH}"
 
-          RUN mkdir -p /home/nanobot/.npm-global \
-              && chown -R nanobot:nanobot /home/nanobot/.npm-global
+          # Make executables installed by npm globally available.
+          ENV PATH="/home/nanobot/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
+
+          # Create Nanobot's npm directories and persistent npm config.
+          RUN mkdir -p /home/nanobot/.npm-global/bin \
+              /home/nanobot/.npm-global/lib/node_modules \
+              && printf 'prefix=/home/nanobot/.npm-global\n' \
+                  > /home/nanobot/.npmrc \
+              && chown -R nanobot:nanobot \
+                  /home/nanobot/.npm-global \
+                  /home/nanobot/.npmrc
 
           # --------------------------------------------------------
-          # End custom runtime tools
+          # End custom Nanobot runtime tools
           # --------------------------------------------------------
 
           '''
@@ -177,7 +196,7 @@ jobs:
             type=raw,value=${{ steps.get_release.outputs.tag }}
 
       # ------------------------------------------------------------
-      # Build
+      # Build and push
       # ------------------------------------------------------------
 
       - name: Build and push Docker image

@@ -46,7 +46,7 @@ jobs:
           echo "tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
 
       # ------------------------------------------------------------
-      # Checkout that exact upstream release
+      # Checkout exact upstream release
       # ------------------------------------------------------------
 
       - name: Checkout upstream repository
@@ -71,22 +71,17 @@ jobs:
           text = dockerfile.read_text()
 
           # --------------------------------------------------------
-          # Add official Node.js 24 as an additional build stage.
-          #
-          # We intentionally do NOT install Debian's nodejs/npm
-          # packages because they currently provide Node 18, which
-          # is too old for packages such as Hyperframes/Puppeteer.
+          # Add a Node.js 24 source stage.
           # --------------------------------------------------------
 
           text = "FROM node:24-bookworm-slim AS node-runtime\n\n" + text
 
           # --------------------------------------------------------
-          # Add runtime CLI tools.
+          # Add curl + GitHub CLI to the final runtime image.
           #
-          # curl -> Weather and general HTTP-based skills
-          # gh   -> GitHub skill
-          #
-          # Node/npm/npx come from node-runtime above.
+          # Node/npm are deliberately NOT installed from Debian,
+          # because Debian's packaged Node version may be too old
+          # for current Nanobot CLI apps.
           # --------------------------------------------------------
 
           original = (
@@ -103,33 +98,22 @@ jobs:
           if original not in text:
               raise SystemExit(
                   "ERROR: Upstream Dockerfile package line has changed. "
-                  "Refusing to modify it automatically."
+                  "Refusing to modify automatically."
               )
 
           text = text.replace(original, replacement, 1)
 
           # --------------------------------------------------------
-          # Add Node.js 24 and configure npm for the unprivileged
-          # Nanobot user.
-          #
-          # Nanobot's CLI app installer runs:
-          #
-          #     npm install -g <package>
-          #
-          # Global npm packages therefore need a location writable
-          # by UID 1000 rather than /usr/local/lib/node_modules.
-          #
-          # .npmrc is intentionally created as well as setting the
-          # environment variable so npm still sees the correct
-          # prefix if Nanobot sanitises subprocess environment vars.
+          # Insert our runtime additions immediately before
+          # upstream ENTRYPOINT.
           # --------------------------------------------------------
 
-          marker = "ENTRYPOINT"
+          marker = 'ENTRYPOINT ["entrypoint.sh"]'
 
           if marker not in text:
               raise SystemExit(
-                  "ERROR: Could not find ENTRYPOINT in upstream Dockerfile. "
-                  "Refusing to modify it automatically."
+                  "ERROR: Could not find upstream ENTRYPOINT. "
+                  "Refusing to modify automatically."
               )
 
           additions = r'''
@@ -140,21 +124,56 @@ jobs:
           # Node.js 24 + npm + npx
           COPY --from=node-runtime /usr/local/ /usr/local/
 
-          # Install global npm packages into Nanobot's home directory
-          # instead of root-owned /usr/local/lib/node_modules.
+          # --------------------------------------------------------
+          # npm configuration
+          # --------------------------------------------------------
+          #
+          # Nanobot runs as UID 1000 after entrypoint initialization.
+          # Global npm installs must therefore NOT target:
+          #
+          #   /usr/local/lib/node_modules
+          #
+          # Instead use a user-writable global package directory.
+          #
           ENV NPM_CONFIG_PREFIX=/home/nanobot/.npm-global
 
-          # Make executables installed by npm globally available.
-          ENV PATH="/home/nanobot/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
+          # IMPORTANT:
+          #
+          # Preserve /app/.venv/bin.
+          #
+          # Nanobot itself is installed here and upstream's
+          # entrypoint executes "nanobot" after dropping privileges.
+          #
+          ENV PATH="/home/nanobot/.npm-global/bin:/app/.venv/bin:/usr/local/bin:/usr/bin:/bin"
 
-          # Create Nanobot's npm directories and persistent npm config.
-          RUN mkdir -p /home/nanobot/.npm-global/bin \
-              /home/nanobot/.npm-global/lib/node_modules \
+          # Create npm global directory and also configure ~/.npmrc.
+          #
+          # ~/.npmrc provides a second layer of protection in case
+          # an npm subprocess does not inherit NPM_CONFIG_PREFIX.
+          #
+          RUN mkdir -p \
+                  /home/nanobot/.npm-global/bin \
+                  /home/nanobot/.npm-global/lib/node_modules \
               && printf 'prefix=/home/nanobot/.npm-global\n' \
                   > /home/nanobot/.npmrc \
               && chown -R nanobot:nanobot \
                   /home/nanobot/.npm-global \
                   /home/nanobot/.npmrc
+
+          # --------------------------------------------------------
+          # Build-time sanity checks
+          # --------------------------------------------------------
+
+          RUN test -x /app/.venv/bin/nanobot \
+              && command -v nanobot \
+              && command -v node \
+              && command -v npm \
+              && command -v npx \
+              && command -v curl \
+              && command -v gh \
+              && node --version \
+              && npm --version \
+              && npm config get prefix
 
           # --------------------------------------------------------
           # End custom Nanobot runtime tools
@@ -167,6 +186,7 @@ jobs:
           dockerfile.write_text(text)
           PY
 
+          echo
           echo "========================================"
           echo "Patched Dockerfile"
           echo "========================================"
@@ -196,7 +216,7 @@ jobs:
             type=raw,value=${{ steps.get_release.outputs.tag }}
 
       # ------------------------------------------------------------
-      # Build and push
+      # Build + push
       # ------------------------------------------------------------
 
       - name: Build and push Docker image

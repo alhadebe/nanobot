@@ -56,7 +56,7 @@ jobs:
           ref: ${{ steps.get_release.outputs.tag }}
 
       # ------------------------------------------------------------
-      # Inject extra runtime tools
+      # Patch upstream Dockerfile
       # ------------------------------------------------------------
 
       - name: Add CLI tools and Node.js 24 to Nanobot image
@@ -71,17 +71,16 @@ jobs:
           text = dockerfile.read_text()
 
           # --------------------------------------------------------
-          # Add a Node.js 24 source stage.
+          # Add Node.js 24 source stage
           # --------------------------------------------------------
 
           text = "FROM node:24-bookworm-slim AS node-runtime\n\n" + text
 
           # --------------------------------------------------------
-          # Add curl + GitHub CLI to the final runtime image.
+          # Add curl + GitHub CLI to upstream runtime packages.
           #
-          # Node/npm are deliberately NOT installed from Debian,
-          # because Debian's packaged Node version may be too old
-          # for current Nanobot CLI apps.
+          # Do NOT use Debian nodejs/npm because that previously
+          # gave us Node 18, which is too old for newer CLI apps.
           # --------------------------------------------------------
 
           original = (
@@ -104,8 +103,8 @@ jobs:
           text = text.replace(original, replacement, 1)
 
           # --------------------------------------------------------
-          # Insert our runtime additions immediately before
-          # upstream ENTRYPOINT.
+          # Insert our additions immediately before upstream
+          # ENTRYPOINT.
           # --------------------------------------------------------
 
           marker = 'ENTRYPOINT ["entrypoint.sh"]'
@@ -117,47 +116,84 @@ jobs:
               )
 
           additions = r'''
-          # --------------------------------------------------------
-          # Custom Nanobot runtime tools
-          # --------------------------------------------------------
+          # ========================================================
+          # Custom Nanobot runtime additions
+          # ========================================================
 
+          # --------------------------------------------------------
           # Node.js 24 + npm + npx
-          COPY --from=node-runtime /usr/local/ /usr/local/
-
-          # --------------------------------------------------------
-          # npm configuration
           # --------------------------------------------------------
           #
-          # Nanobot runs as UID 1000 after entrypoint initialization.
-          # Global npm installs must therefore NOT target:
+          # Copy only the Node runtime and npm modules rather than
+          # replacing the entire /usr/local tree.
+          #
+
+          COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
+          COPY --from=node-runtime /usr/local/lib/node_modules /usr/local/lib/node_modules
+
+          RUN ln -sf ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+              && ln -sf ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
+
+          # --------------------------------------------------------
+          # npm global package installation
+          # --------------------------------------------------------
+          #
+          # Nanobot eventually runs as the unprivileged nanobot user.
+          #
+          # npm install -g therefore cannot use:
           #
           #   /usr/local/lib/node_modules
           #
-          # Instead use a user-writable global package directory.
+          # Put globally installed CLI applications here instead:
           #
+          #   /home/nanobot/.npm-global
+          #
+
           ENV NPM_CONFIG_PREFIX=/home/nanobot/.npm-global
 
+          # --------------------------------------------------------
+          # npm cache / logs
+          # --------------------------------------------------------
+          #
+          # npm also needs a writable cache. Without this we get:
+          #
+          #   EACCES /home/nanobot/.npm/_cacache
+          #
+          ENV NPM_CONFIG_CACHE=/home/nanobot/.npm
+
+          # --------------------------------------------------------
+          # PATH
+          # --------------------------------------------------------
+          #
           # IMPORTANT:
           #
-          # Preserve /app/.venv/bin.
+          # /app/.venv/bin contains the actual Nanobot executable.
+          # Removing this caused:
           #
-          # Nanobot itself is installed here and upstream's
-          # entrypoint executes "nanobot" after dropping privileges.
+          #   setpriv: failed to execute nanobot:
+          #   No such file or directory
           #
+          # npm-global/bin is added so apps installed through the
+          # Nanobot WebUI can subsequently be executed.
+          #
+
           ENV PATH="/home/nanobot/.npm-global/bin:/app/.venv/bin:/usr/local/bin:/usr/bin:/bin"
 
-          # Create npm global directory and also configure ~/.npmrc.
-          #
-          # ~/.npmrc provides a second layer of protection in case
-          # an npm subprocess does not inherit NPM_CONFIG_PREFIX.
-          #
+          # --------------------------------------------------------
+          # Create writable npm directories
+          # --------------------------------------------------------
+
           RUN mkdir -p \
                   /home/nanobot/.npm-global/bin \
                   /home/nanobot/.npm-global/lib/node_modules \
-              && printf 'prefix=/home/nanobot/.npm-global\n' \
+                  /home/nanobot/.npm \
+              && printf '%s\n' \
+                  'prefix=/home/nanobot/.npm-global' \
+                  'cache=/home/nanobot/.npm' \
                   > /home/nanobot/.npmrc \
               && chown -R nanobot:nanobot \
                   /home/nanobot/.npm-global \
+                  /home/nanobot/.npm \
                   /home/nanobot/.npmrc
 
           # --------------------------------------------------------
@@ -165,19 +201,22 @@ jobs:
           # --------------------------------------------------------
 
           RUN test -x /app/.venv/bin/nanobot \
+              && test -x /usr/local/bin/node \
               && command -v nanobot \
               && command -v node \
               && command -v npm \
               && command -v npx \
               && command -v curl \
               && command -v gh \
-              && node --version \
-              && npm --version \
-              && npm config get prefix
+              && echo "Nanobot: $(command -v nanobot)" \
+              && echo "Node: $(node --version)" \
+              && echo "npm: $(npm --version)" \
+              && echo "npm prefix: $(npm config get prefix)" \
+              && echo "npm cache: $(npm config get cache)"
 
-          # --------------------------------------------------------
-          # End custom Nanobot runtime tools
-          # --------------------------------------------------------
+          # ========================================================
+          # End custom Nanobot runtime additions
+          # ========================================================
 
           '''
 

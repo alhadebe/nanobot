@@ -2,7 +2,10 @@ name: Build Upstream Nanobot
 
 on:
   schedule:
+    # Check for a new upstream release every day at midnight UTC
     - cron: "0 0 * * *"
+
+  # Allow manual builds
   workflow_dispatch:
 
 env:
@@ -18,6 +21,10 @@ jobs:
       packages: write
 
     steps:
+      # ------------------------------------------------------------
+      # Find latest Nanobot release
+      # ------------------------------------------------------------
+
       - name: Fetch latest release tag from upstream
         id: get_release
         shell: bash
@@ -38,26 +45,43 @@ jobs:
           echo "Latest upstream tag: $LATEST_TAG"
           echo "tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
 
+      # ------------------------------------------------------------
+      # Checkout that exact upstream release
+      # ------------------------------------------------------------
+
       - name: Checkout upstream repository
         uses: actions/checkout@v4
         with:
           repository: HKUDS/nanobot
           ref: ${{ steps.get_release.outputs.tag }}
 
-      - name: Add Nanobot runtime tools
+      # ------------------------------------------------------------
+      # Inject extra runtime tools
+      # ------------------------------------------------------------
+
+      - name: Add CLI tools and Node.js 24 to Nanobot image
         shell: bash
         run: |
           set -euo pipefail
 
-          # Add Node 24 as an additional build stage.
-          sed -i '1i FROM node:24-bookworm-slim AS node-runtime' Dockerfile
-
-          # Add curl + GitHub CLI to the existing runtime packages.
           python3 <<'PY'
           from pathlib import Path
 
-          path = Path("Dockerfile")
-          text = path.read_text()
+          dockerfile = Path("Dockerfile")
+          text = dockerfile.read_text()
+
+          # --------------------------------------------------------
+          # Add official Node.js 24 image as a build stage.
+          # This gives us a modern Node/npm/npx instead of Debian's
+          # older Node.js package.
+          # --------------------------------------------------------
+
+          text = "FROM node:24-bookworm-slim AS node-runtime\n\n" + text
+
+          # --------------------------------------------------------
+          # Add curl + GitHub CLI to Nanobot's runtime packages.
+          # Do NOT install Debian's nodejs/npm packages.
+          # --------------------------------------------------------
 
           original = (
               "apt-get install -y --no-install-recommends "
@@ -72,43 +96,66 @@ jobs:
 
           if original not in text:
               raise SystemExit(
-                  "ERROR: Upstream Dockerfile package line changed."
+                  "ERROR: Upstream Dockerfile package line has changed. "
+                  "Refusing to modify it automatically."
               )
 
-          text = text.replace(original, replacement)
+          text = text.replace(original, replacement, 1)
 
-          # Insert our additions immediately before ENTRYPOINT.
+          # --------------------------------------------------------
+          # Copy Node.js 24 + npm/npx into the final Nanobot image.
+          #
+          # Configure npm global installs to use a directory owned by
+          # the unprivileged nanobot user instead of:
+          #
+          #   /usr/local/lib/node_modules
+          #
+          # This allows Nanobot/ClawHub to install npm-based apps
+          # without running Nanobot as root.
+          # --------------------------------------------------------
+
           marker = "ENTRYPOINT"
 
           if marker not in text:
               raise SystemExit(
-                  "ERROR: Could not locate ENTRYPOINT in upstream Dockerfile."
+                  "ERROR: Could not find ENTRYPOINT in upstream Dockerfile. "
+                  "Refusing to modify it automatically."
               )
 
           additions = r'''
-          # --- Custom runtime additions ---
+          # --------------------------------------------------------
+          # Custom Nanobot runtime tools
+          # --------------------------------------------------------
 
-          # Node.js 24 + npm/npx
+          # Node.js 24 + npm + npx
           COPY --from=node-runtime /usr/local/ /usr/local/
 
-          # Allow the unprivileged nanobot user to install global npm packages.
+          # User-writable location for global npm packages
           ENV NPM_CONFIG_PREFIX=/home/nanobot/.npm-global
           ENV PATH="/home/nanobot/.npm-global/bin:${PATH}"
 
           RUN mkdir -p /home/nanobot/.npm-global \
               && chown -R nanobot:nanobot /home/nanobot/.npm-global
 
-          # --- End custom runtime additions ---
+          # --------------------------------------------------------
+          # End custom runtime tools
+          # --------------------------------------------------------
 
           '''
 
           text = text.replace(marker, additions + marker, 1)
 
-          path.write_text(text)
+          dockerfile.write_text(text)
           PY
 
-          echo "========== Patched Dockerfile =========="
+          echo "========================================"
+          echo "Patched Dockerfile"
+          echo "========================================"
           cat Dockerfile
+
+      # ------------------------------------------------------------
+      # Docker / GHCR
+      # ------------------------------------------------------------
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -128,6 +175,10 @@ jobs:
           tags: |
             type=raw,value=latest
             type=raw,value=${{ steps.get_release.outputs.tag }}
+
+      # ------------------------------------------------------------
+      # Build
+      # ------------------------------------------------------------
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6

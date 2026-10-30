@@ -2,9 +2,8 @@ name: Build Upstream Nanobot
 
 on:
   schedule:
-    # Check latest upstream release daily at midnight UTC
+    # Check for a new stable upstream release daily at midnight UTC
     - cron: "0 0 * * *"
-
   workflow_dispatch:
 
 env:
@@ -14,249 +13,131 @@ env:
 jobs:
   build-and-push-image:
     runs-on: ubuntu-latest
-
     permissions:
       contents: read
       packages: write
 
     steps:
-      # ------------------------------------------------------------
-      # Find latest upstream release
-      # ------------------------------------------------------------
-
-      - name: Fetch latest release tag from upstream
+      - name: Fetch latest stable release tag from upstream
         id: get_release
         shell: bash
         run: |
           set -euo pipefail
-
           LATEST_TAG=$(
             curl -fsSL \
               https://api.github.com/repos/HKUDS/nanobot/releases/latest |
               jq -r '.tag_name'
           )
-
           if [ "$LATEST_TAG" = "null" ] || [ -z "$LATEST_TAG" ]; then
             echo "Error fetching upstream release tag"
             exit 1
           fi
-
           echo "Latest upstream tag: $LATEST_TAG"
           echo "tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
 
-      # ------------------------------------------------------------
-      # Checkout exact upstream release
-      # ------------------------------------------------------------
-
-      - name: Checkout upstream repository
-        uses: actions/checkout@v4
+      - name: Checkout exact upstream release
+        uses: actions/checkout@v5
         with:
           repository: HKUDS/nanobot
           ref: ${{ steps.get_release.outputs.tag }}
+          persist-credentials: false
 
-      # ------------------------------------------------------------
-      # Patch upstream Dockerfile
-      # ------------------------------------------------------------
-
-      - name: Add CLI tools, Chromium and Node.js 24
+      - name: Add custom runtime tools without replacing upstream packages
         shell: bash
         run: |
           set -euo pipefail
-
           python3 <<'PY'
           from pathlib import Path
 
           dockerfile = Path("Dockerfile")
-          text = dockerfile.read_text()
+          source = dockerfile.read_text()
 
-          # --------------------------------------------------------
-          # Use the official Node 24 image as a source stage
-          # --------------------------------------------------------
-
-          text = "FROM node:24-bookworm-slim AS node-runtime\n\n" + text
-
-          # --------------------------------------------------------
-          # Add runtime packages
-          #
-          # curl          HTTP requests / weather skills
-          # gh            GitHub CLI
-          # chromium      Headless browser
-          # ffmpeg        Video/audio processing (Hyperframes)
-          # fonts         Browser rendering
-          #
-          # Node/npm come from the official Node stage.
-          # --------------------------------------------------------
-
-          original = (
-              "apt-get install -y --no-install-recommends "
-              "ca-certificates git bubblewrap openssh-client libmagic1"
-          )
-
-          replacement = (
-              "apt-get install -y --no-install-recommends "
-              "ca-certificates git bubblewrap openssh-client libmagic1 "
-              "curl gh chromium ffmpeg "
-              "fonts-liberation fonts-noto-color-emoji"
-          )
-
-          if original not in text:
+          # Nanobot v0.4.0 already uses Node 24 to build its WebUI.
+          # Reuse this stage instead of injecting another Node FROM.
+          node_stage = "FROM node:24-bookworm-slim AS webui-builder"
+          if node_stage not in source:
               raise SystemExit(
-                  "ERROR: Upstream Dockerfile package line changed. "
-                  "Refusing to modify it automatically."
+                  "ERROR: Upstream Node build stage changed. "
+                  "Review the current upstream Dockerfile before rebuilding."
               )
 
-          text = text.replace(original, replacement, 1)
-
-          # --------------------------------------------------------
-          # Add our runtime configuration before upstream ENTRYPOINT
-          # --------------------------------------------------------
-
           marker = 'ENTRYPOINT ["entrypoint.sh"]'
-
-          if marker not in text:
+          if source.count(marker) != 1:
               raise SystemExit(
-                  "ERROR: Could not find upstream ENTRYPOINT."
+                  "ERROR: Expected exactly one upstream entrypoint. "
+                  "Review the current upstream Dockerfile before rebuilding."
               )
 
           additions = r'''
           # ========================================================
-          # Custom Nanobot runtime additions
+          # Additional runtime tools; upstream Dockerfile preserved
           # ========================================================
 
-          # --------------------------------------------------------
-          # Node.js 24 + npm + npx
-          # --------------------------------------------------------
+          # Keep upstream's packages (including its curl) untouched.
+          # Add GitHub CLI, headless Chromium, FFmpeg and rendering fonts.
+          RUN apt-get update && \
+              apt-get install -y --no-install-recommends \
+                  gh chromium ffmpeg fonts-liberation fonts-noto-color-emoji && \
+              rm -rf /var/lib/apt/lists/*
 
-          COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
-          COPY --from=node-runtime /usr/local/lib/node_modules /usr/local/lib/node_modules
+          # Copy Node 24, npm and npx from upstream's existing WebUI stage.
+          COPY --from=webui-builder /usr/local/bin/node /usr/local/bin/node
+          COPY --from=webui-builder /usr/local/lib/node_modules /usr/local/lib/node_modules
+          RUN ln -sf ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
+              ln -sf ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
 
-          RUN ln -sf ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
-              && ln -sf ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
-
-          # --------------------------------------------------------
-          # Headless Chromium
-          # --------------------------------------------------------
-          #
-          # Installed from Debian packages above.
-          #
-          # Executable:
-          #   /usr/bin/chromium
-          #
-          # Usage:
-          #   chromium --headless --screenshot https://example.com
-          #
-          # CHROME_BIN is useful for applications which support it.
-          #
-          # Do not globally override Puppeteer's executable path:
-          # Hyperframes may require its own pinned headless shell.
-          #
-
+          # Browser auto-discovery for applications that support CHROME_BIN.
           ENV CHROME_BIN=/usr/bin/chromium
 
-          # --------------------------------------------------------
-          # npm global package installation
-          # --------------------------------------------------------
-          #
-          # Nanobot runs as UID 1000.
-          #
-          # Global npm installs must not write to:
-          #   /usr/local/lib/node_modules
-          #
+          # Keep npm global packages and cache writable by UID 1000.
           ENV NPM_CONFIG_PREFIX=/home/nanobot/.npm-global
-
-          # --------------------------------------------------------
-          # npm cache and logs
-          # --------------------------------------------------------
-          #
-          # Avoid EACCES errors writing to:
-          #   /home/nanobot/.npm/_cacache
-          #
           ENV NPM_CONFIG_CACHE=/home/nanobot/.npm
 
-          # --------------------------------------------------------
-          # PATH
-          # --------------------------------------------------------
-          #
-          # Preserve upstream PATH including /app/.venv/bin.
-          # This directory contains the Nanobot executable.
-          #
-          # Also expose executables installed by npm -g.
-          #
+          # Preserve the existing upstream PATH, especially /app/.venv/bin.
           ENV PATH="/home/nanobot/.npm-global/bin:${PATH}"
-
-          # --------------------------------------------------------
-          # Create writable npm directories
-          # --------------------------------------------------------
 
           RUN mkdir -p \
                   /home/nanobot/.npm-global/bin \
                   /home/nanobot/.npm-global/lib/node_modules \
-                  /home/nanobot/.npm \
-              && printf '%s\n' \
+                  /home/nanobot/.npm && \
+              printf '%s\n' \
                   'prefix=/home/nanobot/.npm-global' \
                   'cache=/home/nanobot/.npm' \
-                  > /home/nanobot/.npmrc \
-              && chown -R nanobot:nanobot \
+                  > /home/nanobot/.npmrc && \
+              chown -R nanobot:nanobot \
                   /home/nanobot/.npm-global \
                   /home/nanobot/.npm \
                   /home/nanobot/.npmrc
 
-          # --------------------------------------------------------
-          # Build-time sanity checks
-          # --------------------------------------------------------
-
+          # Abort image builds when a required tool is missing.
           RUN set -eu; \
               test -x /app/.venv/bin/nanobot; \
-              command -v nanobot; \
-              command -v node; \
-              command -v npm; \
-              command -v npx; \
-              command -v curl; \
-              command -v gh; \
-              command -v chromium; \
-              command -v ffmpeg; \
-              echo "=== Nanobot ==="; \
-              command -v nanobot; \
-              echo "=== Node ==="; \
+              for cmd in nanobot node npm npx curl gh chromium ffmpeg; do \
+                  command -v "$cmd"; \
+              done; \
               node --version; \
-              echo "=== npm ==="; \
               npm --version; \
-              echo "=== npm prefix ==="; \
-              npm config get prefix; \
-              echo "=== npm cache ==="; \
-              npm config get cache; \
-              echo "=== Chromium ==="; \
               chromium --version; \
-              echo "=== FFmpeg ==="; \
-              ffmpeg -version | head -1
+              ffmpeg -version | head -1; \
+              test "$(npm config get prefix)" = /home/nanobot/.npm-global; \
+              test "$(npm config get cache)" = /home/nanobot/.npm
 
           # ========================================================
-          # End custom Nanobot runtime additions
+          # End additional runtime tools
           # ========================================================
 
           '''
 
-          text = text.replace(marker, additions + marker, 1)
-
-          dockerfile.write_text(text)
+          dockerfile.write_text(source.replace(marker, additions + marker, 1))
           PY
 
           echo "========================================"
-          echo "Patched Dockerfile"
+          echo "Patched upstream Dockerfile"
           echo "========================================"
-
           cat Dockerfile
-
-      # ------------------------------------------------------------
-      # Docker Buildx
-      # ------------------------------------------------------------
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-
-      # ------------------------------------------------------------
-      # GHCR login
-      # ------------------------------------------------------------
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -264,10 +145,6 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      # ------------------------------------------------------------
-      # Image metadata
-      # ------------------------------------------------------------
 
       - name: Extract Docker metadata
         id: meta
@@ -277,10 +154,6 @@ jobs:
           tags: |
             type=raw,value=latest
             type=raw,value=${{ steps.get_release.outputs.tag }}
-
-      # ------------------------------------------------------------
-      # Build and push
-      # ------------------------------------------------------------
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
